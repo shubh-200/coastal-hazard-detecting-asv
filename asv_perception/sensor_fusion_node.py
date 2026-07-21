@@ -29,6 +29,7 @@ import time
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from tf2_msgs.msg import TFMessage
 from std_msgs.msg import String, ColorRGBA
 from geometry_msgs.msg import PoseStamped, Point, Vector3
 from visualization_msgs.msg import Marker, MarkerArray
@@ -87,6 +88,8 @@ class SensorFusionNode(Node):
             String, '/asv/obstacles', self._obs_cb, 10)
         self.create_subscription(
             PoseStamped, '/wamv/pose', self._pose_cb, gz_qos)
+        self.create_subscription(
+            TFMessage, '/wamv/pose', self._tf_pose_cb, gz_qos)
 
         # ── Publishers ──────────────────────────────────────────
         self.pub_hazards = self.create_publisher(String, '/asv/hazards', 10)
@@ -117,6 +120,18 @@ class SensorFusionNode(Node):
 
     def _pose_cb(self, msg: PoseStamped):
         self.pose = msg
+
+    def _tf_pose_cb(self, msg: TFMessage):
+        for tf in msg.transforms:
+            if 'base_link' in tf.child_frame_id and 'sensor' not in tf.child_frame_id:
+                p = PoseStamped()
+                p.header = tf.header
+                p.pose.position.x = tf.transform.translation.x
+                p.pose.position.y = tf.transform.translation.y
+                p.pose.position.z = tf.transform.translation.z
+                p.pose.orientation = tf.transform.rotation
+                self.pose = p
+                break
 
     # ── Fusion logic ────────────────────────────────────────────────
 

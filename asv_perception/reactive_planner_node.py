@@ -23,6 +23,7 @@ import math
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from tf2_msgs.msg import TFMessage
 from std_msgs.msg import Float64, String
 from geometry_msgs.msg import PoseStamped
 
@@ -79,6 +80,8 @@ class ReactivePlannerNode(Node):
         self.create_subscription(
             PoseStamped, '/wamv/pose', self._pose_cb, gz_qos)
         self.create_subscription(
+            TFMessage, '/wamv/pose', self._tf_pose_cb, gz_qos)
+        self.create_subscription(
             String, '/asv/hazards', self._hazards_cb, 10)
 
         # ── Publishers ───────────────────────────────────────────────
@@ -117,6 +120,19 @@ class ReactivePlannerNode(Node):
 
     def _pose_cb(self, msg: PoseStamped):
         self.pose = msg
+
+    def _tf_pose_cb(self, msg: TFMessage):
+        for tf in msg.transforms:
+            # Match world -> wamv base link transform
+            if 'base_link' in tf.child_frame_id and 'sensor' not in tf.child_frame_id:
+                p = PoseStamped()
+                p.header = tf.header
+                p.pose.position.x = tf.transform.translation.x
+                p.pose.position.y = tf.transform.translation.y
+                p.pose.position.z = tf.transform.translation.z
+                p.pose.orientation = tf.transform.rotation
+                self.pose = p
+                break
 
     def _hazards_cb(self, msg: String):
         try:
