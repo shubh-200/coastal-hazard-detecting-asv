@@ -1,0 +1,37 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Displays:
+    - Class: rviz_default_plugins/Image
+      Name: Detection Overlay
+      Topic:
+        Value: /asv/detection_overlay
+        Reliability Policy: Best Effort
+      Enabled: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Hazard Markers
+      Topic:
+        Value: /asv/hazard_markers
+      Enabled: true
+    - Class: rviz_default_plugins/LaserScan
+      Name: LiDAR Scan
+      Topic:
+        Value: /wamv/sensors/lidars/lidar_wamv_sensor/scan
+        Reliability Policy: Best Effort
+      Size (m): 0.15
+      Color Transformer: FlatColor
+      Color: 0; 255; 0
+      Enabled: true
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+  Global Options:
+    Fixed Frame: world
+  Views:
+    Current:
+      Class: rviz_default_plugins/ThirdPersonFollower
+      Target Frame: wamv/wamv/base_link
+      Distance: 30

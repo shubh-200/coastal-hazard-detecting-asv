@@ -1,0 +1,43 @@
+# HarborWatch patrol configuration for gymkhana_task world
+#
+# Waypoints are in world-frame (x, y) coordinates.
+# IMPORTANT: These are placeholder values! You must determine the actual
+# coordinates by driving the WAM-V through the gymkhana course manually
+# with `ros2 topic echo /wamv/pose` and recording positions at key points.
+#
+# To find good waypoints:
+#   1. Launch: ros2 launch vrx_gz competition.launch.py world:=gymkhana_task
+#   2. In another terminal: ros2 topic echo /wamv/pose
+#   3. Manually drive the WAM-V through the course
+#   4. Note (x, y) at each gate midpoint and at the buoy field entry
+#   5. Replace the waypoints below
+
+# Flat list: [x1, y1, x2, y2, ...] — parsed into (x,y) pairs by the planner
+waypoints:
+  - 0.0
+  - 0.0
+  - 50.0
+  - 0.0
+  - 100.0
+  - 0.0
+  - 100.0
+  - 50.0
+
+patrol:
+  arrival_radius: 5.0     # metres — how close before switching to next waypoint
+  base_thrust: 12.0       # newtons — forward thrust
+  danger_radius: 8.0      # metres — triggers avoidance mode
+  loop_patrol: true       # restart waypoint sequence when done
+
+controller:
+  kp: 5.0                 # proportional gain for heading control
+  kd: 1.0                 # derivative gain for heading control
+  avoidance_gain: 30.0    # repulsive potential field strength
+
+perception:
+  max_process_hz: 10.0    # cap processing rate for camera + lidar
+
+fusion:
+  bearing_tolerance_deg: 8.0   # max bearing diff for camera-lidar match
+  catalogue_merge_dist: 4.0    # metres — closer than this = same hazard
+  fusion_hz: 10.0
