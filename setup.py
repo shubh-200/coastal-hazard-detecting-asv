@@ -39,6 +39,7 @@ setup(
             'lidar_processor_node = asv_perception.lidar_processor_node:main',
             'sensor_fusion_node = asv_perception.sensor_fusion_node:main',
             'reactive_planner_node = asv_perception.reactive_planner_node:main',
+            'teleop_wamv = asv_perception.teleop_wamv:main',
         ],
     },
 )
