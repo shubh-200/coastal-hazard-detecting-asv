@@ -97,14 +97,8 @@ class TeleopWamvNode(Node):
 
         try:
             while rclpy.ok():
-                key = get_key(timeout=0.1)
-                if key is None:
-                    # No key pressed — keep publishing current thrust
-                    # (continuous thrust so the boat doesn't drift silently)
-                    self._publish()
-                    continue
-
-                changed = True
+                start_time = time.time()
+                key = get_key(timeout=0.05)
 
                 if key in ('w', 'W', ARROW_UP):
                     self.left = self.thrust_level
@@ -135,19 +129,20 @@ class TeleopWamvNode(Node):
                     print(f'\r  Thrust level: {self.thrust_level:.0f} N    ', end='')
                 elif key in ('p', 'P'):
                     print('\n  Hint: run in another terminal:')
-                    print('  ros2 topic echo /wamv/pose --once\n')
+                    print('  ros2 topic echo /wamv/pose --field pose.position --rate 1\n')
                 elif key == '\x03':  # Ctrl-C
                     break
-                else:
-                    changed = False
 
-                if changed:
-                    self._publish()
-                    print(f'\r  L: {self.left:+6.1f}  R: {self.right:+6.1f}  '
-                          f'[thrust={self.thrust_level:.0f}N]    ', end='')
+                self._publish()
+
+                # Cap published rate to ~10 Hz (0.1s period) to prevent overloading Gazebo
+                elapsed = time.time() - start_time
+                if elapsed < 0.1:
+                    time.sleep(0.1 - elapsed)
 
         except KeyboardInterrupt:
             pass
+
         finally:
             # Stop the boat on exit
             self.left = 0.0
