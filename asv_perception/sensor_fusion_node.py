@@ -61,7 +61,7 @@ MARKER_COLORS = {
     'black':  ColorRGBA(r=0.15, g=0.15, b=0.15, a=0.85),
 }
 
-MIN_SIGHTINGS_TO_CONFIRM = 3  # Must be seen 3+ frames to be added to hazard count
+MIN_SIGHTINGS_TO_CONFIRM = 2  # Requires 2 consistent frames to confirm hazard
 
 
 class SensorFusionNode(Node):

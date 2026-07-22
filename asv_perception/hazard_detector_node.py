@@ -6,10 +6,10 @@ color and shape:
   - Red conical, Green conical, White conical, Black conical
   - Orange round, Black round
 
-Anti-glare & noise reduction optimizations:
-  - Strict ROI masking (cuts top 35% sky/horizon glare & bottom 25% hull deck)
-  - Calibrated white HSV range (requires high V + very low S to distinguish from reflections)
-  - Higher min contour area (600px) + strict aspect ratio checks
+Tuned for distance & anti-glare:
+  - MIN_CONTOUR_AREA = 30px (captures distant buoys 20m–70m away)
+  - Relaxed saturation thresholds for atmospheric distance blending
+  - Horizon-aware sky crop (top 18% only)
 """
 
 import json
@@ -26,19 +26,19 @@ from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 
 
-# ── Tuned HSV colour ranges (OpenCV HSV: H 0-179, S 0-255, V 0-255) ─────────
+# ── HSV colour ranges (H: 0-179, S: 0-255, V: 0-255) ───────────────────────
 COLOR_RANGES = [
     # Red (two ranges for hue wrap-around)
-    ('red',    np.array([  0, 100, 100]), np.array([  8, 255, 255])),
-    ('red',    np.array([170, 100, 100]), np.array([179, 255, 255])),
+    ('red',    np.array([  0,  45,  70]), np.array([ 12, 255, 255])),
+    ('red',    np.array([168,  45,  70]), np.array([179, 255, 255])),
     # Green
-    ('green',  np.array([ 40,  80,  70]), np.array([ 85, 255, 255])),
+    ('green',  np.array([ 35,  45,  50]), np.array([ 88, 255, 255])),
     # Orange
-    ('orange', np.array([  9, 120, 120]), np.array([ 22, 255, 255])),
-    # White (Tightened: requires extremely bright V and strict low S to avoid water reflection)
-    ('white',  np.array([  0,   0, 220]), np.array([179,  30, 255])),
-    # Black (Very low value, moderate saturation to avoid deep water shadows)
-    ('black',  np.array([  0,   0,   0]), np.array([179, 255,  40])),
+    ('orange', np.array([ 10,  70,  90]), np.array([ 24, 255, 255])),
+    # White (requires high V and low S to separate from water glare)
+    ('white',  np.array([  0,   0, 200]), np.array([179,  40, 255])),
+    # Black (very low value)
+    ('black',  np.array([  0,   0,   0]), np.array([179, 255,  45])),
 ]
 
 DRAW_COLORS = {
@@ -49,9 +49,9 @@ DRAW_COLORS = {
     'black':  (80, 80, 80),
 }
 
-CONICAL_ASPECT_THRESHOLD = 1.2
-MIN_CONTOUR_AREA = 500       # Ignored small glare pixels
-MAX_CONTOUR_FRAC = 0.15      # Ignore giant regions (water/sky patches)
+CONICAL_ASPECT_THRESHOLD = 1.15
+MIN_CONTOUR_AREA = 30         # 30px captures buoys up to ~70 metres away
+MAX_CONTOUR_FRAC = 0.15
 
 
 class HazardDetectorNode(Node):
@@ -90,7 +90,7 @@ class HazardDetectorNode(Node):
         self.pub_detections = self.create_publisher(String, '/asv/detections', 10)
         self.pub_overlay = self.create_publisher(Image, '/asv/detection_overlay', 5)
 
-        self.get_logger().info('HazardDetector initialized with anti-glare filters')
+        self.get_logger().info('HazardDetector initialized (long-range mode enabled)')
 
     def _caminfo_cb(self, msg: CameraInfo):
         if self.camera_hfov is None:
@@ -131,10 +131,9 @@ class HazardDetectorNode(Node):
         h, w = frame.shape[:2]
         img_area = h * w
 
-        # Focus search region strictly on water horizon (35% to 75% height)
-        # Eliminates sky, horizon sun glare, and front deck hull
-        roi_top = int(h * 0.35)
-        roi_bottom = int(h * 0.75)
+        # Crop top 18% sky and bottom 20% hull deck
+        roi_top = int(h * 0.18)
+        roi_bottom = int(h * 0.80)
 
         detections = []
         seen_regions = []
@@ -142,12 +141,11 @@ class HazardDetectorNode(Node):
         for color_name, lower, upper in COLOR_RANGES:
             mask = cv2.inRange(hsv, lower, upper)
 
-            # Crop out sky & deck
             mask[:roi_top, :] = 0
             mask[roi_bottom:, :] = 0
 
-            # Morphological cleanup to eliminate single-pixel glare specs
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            # Morphological cleanup
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
@@ -160,17 +158,17 @@ class HazardDetectorNode(Node):
                     continue
 
                 x, y, bw, bh = cv2.boundingRect(cnt)
-
-                # Skip non-compact shapes (glare streaks on water are very wide and thin)
                 aspect = bh / bw if bw > 0 else 1.0
-                if aspect < 0.3 or aspect > 4.0:
+
+                # Skip extreme wide glare streaks
+                if aspect < 0.25:
                     continue
 
                 cx, cy = x + bw // 2, y + bh // 2
                 duplicate = False
                 for (sx, sy, sw, sh) in seen_regions:
-                    if (abs(cx - (sx + sw // 2)) < sw * 0.6 and
-                            abs(cy - (sy + sh // 2)) < sh * 0.6):
+                    if (abs(cx - (sx + sw // 2)) < max(sw, 10) * 0.6 and
+                            abs(cy - (sy + sh // 2)) < max(sh, 10) * 0.6):
                         duplicate = True
                         break
                 if duplicate:
@@ -215,8 +213,8 @@ class HazardDetectorNode(Node):
 
             cv2.rectangle(overlay, (x, y), (x + bw, y + bh), color, 2)
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(overlay, (x, y - th - 6), (x + tw + 4, y), color, -1)
-            cv2.putText(overlay, label, (x + 2, y - 4),
+            cv2.rectangle(overlay, (x, max(y - th - 6, 0)), (x + tw + 4, max(y, th + 6)), color, -1)
+            cv2.putText(overlay, label, (x + 2, max(y - 4, th)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
                         cv2.LINE_AA)
 
