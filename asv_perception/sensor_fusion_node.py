@@ -1,6 +1,9 @@
 """
 Sensor fusion node — merges camera detections with LiDAR obstacles.
 
+Uses GPS + IMU for vehicle pose (no dependency on sim ground-truth).
+GPS lat/lon is converted to local ENU using the first fix as origin.
+
 Matching strategy:
   Camera gives:  class label + bearing angle (no range)
   LiDAR gives:   range + bearing (no class)
@@ -8,32 +11,46 @@ Matching strategy:
                  a classified, geo-located hazard.
 
 Also maintains a persistent hazard catalogue (unique hazards seen so far)
-for counting purposes, and transforms obstacle positions from body frame
-to world frame using /wamv/pose.
+for counting purposes.
 
 Subscribes:
-  /asv/detections   (std_msgs/String — camera JSON)
-  /asv/obstacles    (std_msgs/String — LiDAR JSON)
-  /wamv/pose        (geometry_msgs/PoseStamped)
+  /asv/detections                     (std_msgs/String — camera JSON)
+  /asv/obstacles                      (std_msgs/String — LiDAR JSON)
+  /wamv/sensors/gps/gps/fix           (sensor_msgs/NavSatFix)
+  /wamv/sensors/imu/imu/data          (sensor_msgs/Imu)
 
 Publishes:
-  /asv/hazards          (std_msgs/String — fused JSON, world-frame)
+  /asv/hazards          (std_msgs/String — fused JSON, ENU-frame)
   /asv/hazard_markers   (visualization_msgs/MarkerArray — for RViz)
   /asv/hazard_log       (std_msgs/String — running count summary)
 """
 
 import json
 import math
-import time
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
-from tf2_msgs.msg import TFMessage
 from std_msgs.msg import String, ColorRGBA
-from geometry_msgs.msg import PoseStamped, Point, Vector3
+from sensor_msgs.msg import NavSatFix, Imu
+from geometry_msgs.msg import Point, Vector3
 from visualization_msgs.msg import Marker, MarkerArray
 from builtin_interfaces.msg import Duration
+
+
+def gps_to_enu(lat, lon, origin_lat, origin_lon):
+    """Convert GPS lat/lon to local ENU (East, North) metres."""
+    lat_r = math.radians(lat)
+    origin_lat_r = math.radians(origin_lat)
+    R_EARTH = 6378137.0
+    E2 = 0.00669437999014
+    sin_lat = math.sin(origin_lat_r)
+    N = R_EARTH / math.sqrt(1 - E2 * sin_lat * sin_lat)
+    dlat = math.radians(lat - origin_lat)
+    dlon = math.radians(lon - origin_lon)
+    north = dlat * (N * (1 - E2) / (1 - E2 * sin_lat * sin_lat))
+    east = dlon * N * math.cos(origin_lat_r)
+    return east, north
 
 
 def yaw_from_quaternion(q):
@@ -53,14 +70,14 @@ MARKER_COLORS = {
 
 
 class SensorFusionNode(Node):
-    """Fuses camera class labels with LiDAR positions + maintains hazard catalogue."""
+    """Fuses camera class labels with LiDAR positions using GPS/IMU pose."""
 
     def __init__(self):
         super().__init__('sensor_fusion_node')
 
         # ── Parameters ──────────────────────────────────────────
         self.declare_parameter('bearing_tolerance_deg', 8.0)
-        self.declare_parameter('catalogue_merge_dist', 4.0)  # metres
+        self.declare_parameter('catalogue_merge_dist', 4.0)
         self.declare_parameter('fusion_hz', 10.0)
 
         self.bearing_tol = self.get_parameter('bearing_tolerance_deg').value
@@ -68,10 +85,12 @@ class SensorFusionNode(Node):
         fusion_dt = 1.0 / self.get_parameter('fusion_hz').value
 
         # ── State ───────────────────────────────────────────────
-        self.latest_detections = []   # from camera
-        self.latest_obstacles = []    # from LiDAR
-        self.pose = None              # latest vehicle pose
-        self.hazard_catalogue = []    # persistent unique hazards
+        self.latest_detections = []
+        self.latest_obstacles = []
+        self.gps_origin = None
+        self.pos_enu = None       # (east, north)
+        self.yaw = None
+        self.hazard_catalogue = []
         self.next_hazard_id = 0
 
         # ── QoS ─────────────────────────────────────────────────
@@ -87,9 +106,9 @@ class SensorFusionNode(Node):
         self.create_subscription(
             String, '/asv/obstacles', self._obs_cb, 10)
         self.create_subscription(
-            PoseStamped, '/wamv/pose', self._pose_cb, gz_qos)
+            NavSatFix, '/wamv/sensors/gps/gps/fix', self._gps_cb, gz_qos)
         self.create_subscription(
-            TFMessage, '/wamv/pose', self._tf_pose_cb, gz_qos)
+            Imu, '/wamv/sensors/imu/imu/data', self._imu_cb, gz_qos)
 
         # ── Publishers ──────────────────────────────────────────
         self.pub_hazards = self.create_publisher(String, '/asv/hazards', 10)
@@ -118,30 +137,26 @@ class SensorFusionNode(Node):
         except json.JSONDecodeError:
             self.latest_obstacles = []
 
-    def _pose_cb(self, msg: PoseStamped):
-        self.pose = msg
+    def _gps_cb(self, msg: NavSatFix):
+        lat, lon = msg.latitude, msg.longitude
+        if self.gps_origin is None:
+            self.gps_origin = (lat, lon)
+            self.get_logger().info(
+                f'Fusion GPS origin: ({lat:.6f}, {lon:.6f})')
+        e, n = gps_to_enu(lat, lon, self.gps_origin[0], self.gps_origin[1])
+        self.pos_enu = (e, n)
 
-    def _tf_pose_cb(self, msg: TFMessage):
-        for tf in msg.transforms:
-            if 'base_link' in tf.child_frame_id and 'sensor' not in tf.child_frame_id:
-                p = PoseStamped()
-                p.header = tf.header
-                p.pose.position.x = tf.transform.translation.x
-                p.pose.position.y = tf.transform.translation.y
-                p.pose.position.z = tf.transform.translation.z
-                p.pose.orientation = tf.transform.rotation
-                self.pose = p
-                break
+    def _imu_cb(self, msg: Imu):
+        self.yaw = yaw_from_quaternion(msg.orientation)
 
     # ── Fusion logic ────────────────────────────────────────────────
 
     def _fuse(self):
-        if self.pose is None:
+        if self.pos_enu is None or self.yaw is None:
             return
 
-        px = self.pose.pose.position.x
-        py = self.pose.pose.position.y
-        yaw = yaw_from_quaternion(self.pose.pose.orientation)
+        px, py = self.pos_enu
+        yaw = self.yaw
 
         fused_hazards = []
         used_obstacle_indices = set()
@@ -165,8 +180,7 @@ class SensorFusionNode(Node):
                 used_obstacle_indices.add(best_match)
                 obs = self.latest_obstacles[best_match]
 
-                # Transform obstacle from body frame to world frame
-                # Body frame: x forward, y left of vehicle
+                # Transform body-frame obstacle → ENU
                 bx, by = obs['x'], obs['y']
                 wx = px + bx * math.cos(yaw) - by * math.sin(yaw)
                 wy = py + bx * math.sin(yaw) + by * math.cos(yaw)
@@ -183,7 +197,6 @@ class SensorFusionNode(Node):
                 }
                 fused_hazards.append(hazard)
             else:
-                # Camera-only detection (no LiDAR match) — bearing only
                 fused_hazards.append({
                     'class': det.get('class', 'unknown'),
                     'color': det.get('color', 'unknown'),
@@ -213,10 +226,10 @@ class SensorFusionNode(Node):
                 'source': 'lidar_only',
             })
 
-        # ── Update hazard catalogue (counting) ──────────────────
+        # ── Update hazard catalogue ─────────────────────────────
         for h in fused_hazards:
             if h['x'] is None:
-                continue  # can't catalogue without position
+                continue
             self._catalogue_hazard(h)
 
         # ── Publish ─────────────────────────────────────────────
@@ -224,20 +237,17 @@ class SensorFusionNode(Node):
         self._publish_markers()
         self._publish_log()
 
-    # ── Hazard catalogue management ─────────────────────────────────
+    # ── Hazard catalogue ────────────────────────────────────────────
 
     def _catalogue_hazard(self, hazard: dict):
-        """Add to catalogue if it's a genuinely new hazard (far from known ones)."""
         hx, hy = hazard['x'], hazard['y']
         for cat in self.hazard_catalogue:
             dx = hx - cat['x']
             dy = hy - cat['y']
             if math.hypot(dx, dy) < self.merge_dist:
-                # Close to existing — update position (running average)
                 cat['x'] = round(0.8 * cat['x'] + 0.2 * hx, 2)
                 cat['y'] = round(0.8 * cat['y'] + 0.2 * hy, 2)
                 cat['sightings'] += 1
-                # Update class if we got a better match (fused > lidar_only)
                 if hazard['source'] == 'fused' and cat['source'] != 'fused':
                     cat['class'] = hazard['class']
                     cat['color'] = hazard['color']
@@ -245,7 +255,6 @@ class SensorFusionNode(Node):
                     cat['source'] = hazard['source']
                 return
 
-        # New hazard
         hazard['id'] = self.next_hazard_id
         hazard['sightings'] = 1
         self.next_hazard_id += 1
@@ -262,10 +271,7 @@ class SensorFusionNode(Node):
         self.pub_hazards.publish(msg)
 
     def _publish_markers(self):
-        """Publish RViz MarkerArray for all catalogued hazards."""
         ma = MarkerArray()
-
-        # First, a DELETE_ALL marker to clear stale ones
         delete = Marker()
         delete.action = Marker.DELETEALL
         ma.markers.append(delete)
@@ -278,12 +284,10 @@ class SensorFusionNode(Node):
             m.id = h['id']
             m.type = Marker.CYLINDER
             m.action = Marker.ADD
-
             m.pose.position = Point(
                 x=float(h['x']), y=float(h['y']), z=0.0)
             m.pose.orientation.w = 1.0
 
-            # Size: conical → tall cylinder, round → short cylinder
             if h.get('shape') == 'conical':
                 m.scale = Vector3(x=0.6, y=0.6, z=2.0)
             else:
@@ -292,11 +296,9 @@ class SensorFusionNode(Node):
             m.color = MARKER_COLORS.get(
                 h.get('color', 'unknown'),
                 ColorRGBA(r=0.5, g=0.5, b=0.5, a=0.85))
-
-            m.lifetime = Duration(sec=0)  # persistent
+            m.lifetime = Duration(sec=0)
             ma.markers.append(m)
 
-            # Text label above the marker
             t = Marker()
             t.header = m.header
             t.ns = 'hazard_labels'
@@ -315,7 +317,6 @@ class SensorFusionNode(Node):
         self.pub_markers.publish(ma)
 
     def _publish_log(self):
-        """Publish a running count summary of unique hazards by class."""
         counts = {}
         for h in self.hazard_catalogue:
             cls = h.get('class', 'unknown')

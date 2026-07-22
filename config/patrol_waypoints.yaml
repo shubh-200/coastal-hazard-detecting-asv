@@ -1,18 +1,25 @@
 # HarborWatch patrol configuration for gymkhana_task world
 #
-# Waypoints are in world-frame (x, y) coordinates.
-# IMPORTANT: These are placeholder values! You must determine the actual
-# coordinates by driving the WAM-V through the gymkhana course manually
-# with `ros2 topic echo /wamv/pose` and recording positions at key points.
+# Waypoints can be specified as:
+#   - GPS lat/lon pairs (default): [lat1, lon1, lat2, lon2, ...]
+#   - Local ENU pairs (set use_enu_waypoints: true): [east1, north1, ...]
 #
-# To find good waypoints:
-#   1. Launch: ros2 launch vrx_gz competition.launch.py world:=gymkhana_task
-#   2. In another terminal: ros2 topic echo /wamv/pose
-#   3. Manually drive the WAM-V through the course
-#   4. Note (x, y) at each gate midpoint and at the buoy field entry
-#   5. Replace the waypoints below
+# For ENU mode, coordinates are metres relative to the GPS origin
+# (which is set automatically from the first GPS fix).
+#
+# HOW TO RECORD WAYPOINTS:
+#   1. Launch sim:  ros2 launch vrx_gz competition.launch.py world:=gymkhana_task
+#   2. Run planner: ros2 run asv_perception reactive_planner_node
+#      (it will log the GPS origin and start publishing /asv/vehicle_enu)
+#   3. Run teleop:  ros2 run asv_perception teleop_wamv
+#   4. Echo ENU:    ros2 topic echo /asv/vehicle_enu --rate 1
+#   5. Drive through the course, note east/north values at key points
+#   6. Put those values below with use_enu_waypoints: true
 
-# Flat list: [x1, y1, x2, y2, ...] — parsed into (x,y) pairs by the planner
+# Using ENU waypoints (metres relative to GPS origin)
+use_enu_waypoints: true
+
+# Placeholder waypoints — replace with actual values after driving the course
 waypoints:
   - 0.0
   - 0.0
@@ -24,20 +31,20 @@ waypoints:
   - 50.0
 
 patrol:
-  arrival_radius: 5.0     # metres — how close before switching to next waypoint
-  base_thrust: 12.0       # newtons — forward thrust
+  arrival_radius: 5.0     # metres
+  base_thrust: 8.0        # newtons — keep low for WSL2 sim stability
   danger_radius: 8.0      # metres — triggers avoidance mode
-  loop_patrol: true       # restart waypoint sequence when done
+  loop_patrol: true
 
 controller:
-  kp: 5.0                 # proportional gain for heading control
-  kd: 1.0                 # derivative gain for heading control
-  avoidance_gain: 30.0    # repulsive potential field strength
+  kp: 5.0
+  kd: 1.0
+  avoidance_gain: 30.0
 
 perception:
-  max_process_hz: 10.0    # cap processing rate for camera + lidar
+  max_process_hz: 10.0
 
 fusion:
-  bearing_tolerance_deg: 8.0   # max bearing diff for camera-lidar match
-  catalogue_merge_dist: 4.0    # metres — closer than this = same hazard
+  bearing_tolerance_deg: 8.0
+  catalogue_merge_dist: 4.0
   fusion_hz: 10.0

@@ -92,8 +92,9 @@ def generate_launch_description():
         name='reactive_planner_node',
         output='screen',
         parameters=[config_file, {
+            'use_enu_waypoints': True,
             'arrival_radius': 5.0,
-            'base_thrust': 12.0,
+            'base_thrust': 8.0,
             'danger_radius': 8.0,
             'kp': 5.0,
             'kd': 1.0,
