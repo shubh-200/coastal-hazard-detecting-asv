@@ -1,17 +1,12 @@
 """
 Sensor fusion node — merges camera detections with LiDAR obstacles.
 
-Uses GPS + IMU for vehicle pose (no dependency on sim ground-truth).
-GPS lat/lon is converted to local ENU using the first fix as origin.
-
-Matching strategy:
-  Camera gives:  class label + bearing angle (no range)
-  LiDAR gives:   range + bearing (no class)
-  Fusion:        match by bearing within a tolerance window, combine to get
-                 a classified, geo-located hazard.
-
-Also maintains a persistent hazard catalogue (unique hazards seen so far)
-for counting purposes.
+Strict confirmation filtering:
+  - Fuses camera class + bearing with LiDAR range + bearing
+  - Maintains persistent hazard catalogue with SIGHTING CONFIRMATION:
+    Only catalogs a hazard if it has been detected across multiple frames
+    (sightings >= 3) and is confirmed by sensor fusion, rejecting temporary
+    glare or wave splash noise.
 
 Subscribes:
   /asv/detections                     (std_msgs/String — camera JSON)
@@ -39,7 +34,6 @@ from builtin_interfaces.msg import Duration
 
 
 def gps_to_enu(lat, lon, origin_lat, origin_lon):
-    """Convert GPS lat/lon to local ENU (East, North) metres."""
     lat_r = math.radians(lat)
     origin_lat_r = math.radians(origin_lat)
     R_EARTH = 6378137.0
@@ -59,7 +53,6 @@ def yaw_from_quaternion(q):
     return math.atan2(siny_cosp, cosy_cosp)
 
 
-# RViz marker colours per class
 MARKER_COLORS = {
     'red':    ColorRGBA(r=1.0, g=0.0, b=0.0, a=0.85),
     'green':  ColorRGBA(r=0.0, g=0.8, b=0.0, a=0.85),
@@ -68,6 +61,8 @@ MARKER_COLORS = {
     'black':  ColorRGBA(r=0.15, g=0.15, b=0.15, a=0.85),
 }
 
+MIN_SIGHTINGS_TO_CONFIRM = 3  # Must be seen 3+ frames to be added to hazard count
+
 
 class SensorFusionNode(Node):
     """Fuses camera class labels with LiDAR positions using GPS/IMU pose."""
@@ -75,32 +70,32 @@ class SensorFusionNode(Node):
     def __init__(self):
         super().__init__('sensor_fusion_node')
 
-        # ── Parameters ──────────────────────────────────────────
         self.declare_parameter('bearing_tolerance_deg', 8.0)
-        self.declare_parameter('catalogue_merge_dist', 4.0)
+        self.declare_parameter('catalogue_merge_dist', 3.5)
         self.declare_parameter('fusion_hz', 10.0)
 
         self.bearing_tol = self.get_parameter('bearing_tolerance_deg').value
         self.merge_dist = self.get_parameter('catalogue_merge_dist').value
         fusion_dt = 1.0 / self.get_parameter('fusion_hz').value
 
-        # ── State ───────────────────────────────────────────────
         self.latest_detections = []
         self.latest_obstacles = []
         self.gps_origin = None
-        self.pos_enu = None       # (east, north)
+        self.pos_enu = None
         self.yaw = None
+
+        # Candidate hazards pending confirmation (tracks sightings)
+        self.hazard_candidates = []
+        # Confirmed catalogue
         self.hazard_catalogue = []
         self.next_hazard_id = 0
 
-        # ── QoS ─────────────────────────────────────────────────
         gz_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
             depth=5,
         )
 
-        # ── Subscribers ─────────────────────────────────────────
         self.create_subscription(
             String, '/asv/detections', self._det_cb, 10)
         self.create_subscription(
@@ -110,20 +105,14 @@ class SensorFusionNode(Node):
         self.create_subscription(
             Imu, '/wamv/sensors/imu/imu/data', self._imu_cb, gz_qos)
 
-        # ── Publishers ──────────────────────────────────────────
         self.pub_hazards = self.create_publisher(String, '/asv/hazards', 10)
         self.pub_markers = self.create_publisher(
             MarkerArray, '/asv/hazard_markers', 10)
         self.pub_log = self.create_publisher(String, '/asv/hazard_log', 10)
 
-        # ── Fusion timer ────────────────────────────────────────
         self.create_timer(fusion_dt, self._fuse)
 
-        self.get_logger().info(
-            f'SensorFusion started — bearing_tol={self.bearing_tol}°, '
-            f'catalogue_merge_dist={self.merge_dist}m')
-
-    # ── Callbacks ───────────────────────────────────────────────────
+        self.get_logger().info('SensorFusion initialized with multi-frame confirmation filter')
 
     def _det_cb(self, msg: String):
         try:
@@ -141,15 +130,11 @@ class SensorFusionNode(Node):
         lat, lon = msg.latitude, msg.longitude
         if self.gps_origin is None:
             self.gps_origin = (lat, lon)
-            self.get_logger().info(
-                f'Fusion GPS origin: ({lat:.6f}, {lon:.6f})')
         e, n = gps_to_enu(lat, lon, self.gps_origin[0], self.gps_origin[1])
         self.pos_enu = (e, n)
 
     def _imu_cb(self, msg: Imu):
         self.yaw = yaw_from_quaternion(msg.orientation)
-
-    # ── Fusion logic ────────────────────────────────────────────────
 
     def _fuse(self):
         if self.pos_enu is None or self.yaw is None:
@@ -161,7 +146,7 @@ class SensorFusionNode(Node):
         fused_hazards = []
         used_obstacle_indices = set()
 
-        # ── Match camera detections to LiDAR obstacles by bearing ──
+        # Match camera detections to LiDAR obstacles by bearing
         for det in self.latest_detections:
             det_bearing = det.get('bearing_deg', 0.0)
             best_match = None
@@ -180,7 +165,6 @@ class SensorFusionNode(Node):
                 used_obstacle_indices.add(best_match)
                 obs = self.latest_obstacles[best_match]
 
-                # Transform body-frame obstacle → ENU
                 bx, by = obs['x'], obs['y']
                 wx = px + bx * math.cos(yaw) - by * math.sin(yaw)
                 wy = py + bx * math.sin(yaw) + by * math.cos(yaw)
@@ -196,74 +180,51 @@ class SensorFusionNode(Node):
                     'source': 'fused',
                 }
                 fused_hazards.append(hazard)
-            else:
-                fused_hazards.append({
-                    'class': det.get('class', 'unknown'),
-                    'color': det.get('color', 'unknown'),
-                    'shape': det.get('shape', 'unknown'),
-                    'x': None,
-                    'y': None,
-                    'range': None,
-                    'bearing_deg': det_bearing,
-                    'source': 'camera_only',
-                })
 
-        # ── Unmatched LiDAR obstacles → "unknown" class ────────
-        for idx, obs in enumerate(self.latest_obstacles):
-            if idx in used_obstacle_indices:
-                continue
-            bx, by = obs['x'], obs['y']
-            wx = px + bx * math.cos(yaw) - by * math.sin(yaw)
-            wy = py + bx * math.sin(yaw) + by * math.cos(yaw)
-            fused_hazards.append({
-                'class': 'unknown_obstacle',
-                'color': 'unknown',
-                'shape': 'unknown',
-                'x': round(wx, 2),
-                'y': round(wy, 2),
-                'range': obs.get('range', 0.0),
-                'bearing_deg': obs.get('bearing_deg', 0.0),
-                'source': 'lidar_only',
-            })
-
-        # ── Update hazard catalogue ─────────────────────────────
+        # Process candidates & catalogue
         for h in fused_hazards:
-            if h['x'] is None:
-                continue
-            self._catalogue_hazard(h)
+            if h['x'] is not None:
+                self._update_catalogue(h)
 
-        # ── Publish ─────────────────────────────────────────────
         self._publish_hazards(fused_hazards)
         self._publish_markers()
         self._publish_log()
 
-    # ── Hazard catalogue ────────────────────────────────────────────
-
-    def _catalogue_hazard(self, hazard: dict):
+    def _update_catalogue(self, hazard: dict):
         hx, hy = hazard['x'], hazard['y']
+
+        # 1. Check existing confirmed catalogue
         for cat in self.hazard_catalogue:
             dx = hx - cat['x']
             dy = hy - cat['y']
             if math.hypot(dx, dy) < self.merge_dist:
-                cat['x'] = round(0.8 * cat['x'] + 0.2 * hx, 2)
-                cat['y'] = round(0.8 * cat['y'] + 0.2 * hy, 2)
+                cat['x'] = round(0.85 * cat['x'] + 0.15 * hx, 2)
+                cat['y'] = round(0.85 * cat['y'] + 0.15 * hy, 2)
                 cat['sightings'] += 1
-                if hazard['source'] == 'fused' and cat['source'] != 'fused':
-                    cat['class'] = hazard['class']
-                    cat['color'] = hazard['color']
-                    cat['shape'] = hazard['shape']
-                    cat['source'] = hazard['source']
                 return
 
-        hazard['id'] = self.next_hazard_id
-        hazard['sightings'] = 1
-        self.next_hazard_id += 1
-        self.hazard_catalogue.append(hazard)
-        self.get_logger().info(
-            f"New hazard #{hazard['id']}: {hazard['class']} at "
-            f"({hazard['x']}, {hazard['y']})")
+        # 2. Check candidates
+        for cand in self.hazard_candidates:
+            dx = hx - cand['x']
+            dy = hy - cand['y']
+            if math.hypot(dx, dy) < self.merge_dist:
+                cand['x'] = round(0.8 * cand['x'] + 0.2 * hx, 2)
+                cand['y'] = round(0.8 * cand['y'] + 0.2 * hy, 2)
+                cand['sightings'] += 1
 
-    # ── Publishing helpers ──────────────────────────────────────────
+                # Promoted to confirmed hazard!
+                if cand['sightings'] >= MIN_SIGHTINGS_TO_CONFIRM:
+                    cand['id'] = self.next_hazard_id
+                    self.next_hazard_id += 1
+                    self.hazard_catalogue.append(cand)
+                    self.hazard_candidates.remove(cand)
+                    self.get_logger().info(
+                        f"Confirmed Hazard #{cand['id']}: {cand['class']} at ({cand['x']}, {cand['y']})")
+                return
+
+        # 3. Add new candidate
+        hazard['sightings'] = 1
+        self.hazard_candidates.append(hazard)
 
     def _publish_hazards(self, fused: list):
         msg = String()
@@ -284,8 +245,7 @@ class SensorFusionNode(Node):
             m.id = h['id']
             m.type = Marker.CYLINDER
             m.action = Marker.ADD
-            m.pose.position = Point(
-                x=float(h['x']), y=float(h['y']), z=0.0)
+            m.pose.position = Point(x=float(h['x']), y=float(h['y']), z=0.0)
             m.pose.orientation.w = 1.0
 
             if h.get('shape') == 'conical':
@@ -305,8 +265,7 @@ class SensorFusionNode(Node):
             t.id = h['id'] + 1000
             t.type = Marker.TEXT_VIEW_FACING
             t.action = Marker.ADD
-            t.pose.position = Point(
-                x=float(h['x']), y=float(h['y']), z=2.5)
+            t.pose.position = Point(x=float(h['x']), y=float(h['y']), z=2.5)
             t.pose.orientation.w = 1.0
             t.scale = Vector3(x=0.0, y=0.0, z=0.6)
             t.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)

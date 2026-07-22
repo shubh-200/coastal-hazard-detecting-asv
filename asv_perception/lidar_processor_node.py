@@ -1,21 +1,10 @@
 """
 LiDAR obstacle detector using 2D LaserScan clustering.
 
-Uses the 2D /scan topic (horizontal LiDAR slice) rather than the full
-3D PointCloud2 — much lighter to process and perfectly adequate for
-surface-level floating objects like buoys.
-
-Pipeline:
-  1. Convert LaserScan ranges → (x, y) points in LiDAR frame
-  2. Filter out inf/nan and clamp to working range
-  3. DBSCAN-style clustering (simple numpy implementation)
-  4. Compute centroid, diameter, and point count for each cluster
-
-Subscribes:
-  /wamv/sensors/lidars/lidar_wamv_sensor/scan  (sensor_msgs/LaserScan)
-
-Publishes:
-  /asv/obstacles  (std_msgs/String — JSON array of obstacle dicts)
+Optimized for water surface clutter:
+  - Higher min_range (3.5m) to exclude boat hull & bow wake
+  - DBSCAN min_samples raised to 7 to filter single-frame wave splash
+  - Cluster diameter filtering (0.3m to 2.5m) to discard wave crests
 """
 
 import json
@@ -32,16 +21,6 @@ from sensor_msgs.msg import LaserScan
 
 
 def simple_dbscan(points: np.ndarray, eps: float, min_samples: int) -> list:
-    """Minimal DBSCAN implementation using numpy (no sklearn dependency).
-
-    Args:
-        points: (N, 2) array of 2D points.
-        eps: Maximum distance between two points in the same cluster.
-        min_samples: Minimum number of points to form a cluster.
-
-    Returns:
-        List of clusters, each cluster being an (M, 2) array of points.
-    """
     n = len(points)
     if n == 0:
         return []
@@ -55,12 +34,11 @@ def simple_dbscan(points: np.ndarray, eps: float, min_samples: int) -> list:
             continue
         visited[i] = True
 
-        # Find neighbours within eps
         dists = np.linalg.norm(points - points[i], axis=1)
         neighbours = np.where(dists < eps)[0]
 
         if len(neighbours) < min_samples:
-            continue  # noise point
+            continue
 
         labels[i] = cluster_id
         seed_set = list(neighbours)
@@ -92,12 +70,11 @@ class LidarProcessorNode(Node):
     def __init__(self):
         super().__init__('lidar_processor_node')
 
-        # ── Parameters ──────────────────────────────────────────
-        self.declare_parameter('min_range', 2.0)       # ignore very close (deck)
-        self.declare_parameter('max_range', 60.0)      # ignore far noise
-        self.declare_parameter('cluster_eps', 1.5)     # DBSCAN eps (metres)
-        self.declare_parameter('cluster_min_pts', 3)   # DBSCAN min_samples
-        self.declare_parameter('max_process_hz', 10.0) # throttle
+        self.declare_parameter('min_range', 3.5)       # Exclude boat hull & bow wake
+        self.declare_parameter('max_range', 60.0)
+        self.declare_parameter('cluster_eps', 1.2)     # Slightly tighter eps
+        self.declare_parameter('cluster_min_pts', 7)   # Raised to 7 (wave splash has 2-4 pts)
+        self.declare_parameter('max_process_hz', 10.0)
 
         self.min_range = self.get_parameter('min_range').value
         self.max_range = self.get_parameter('max_range').value
@@ -106,14 +83,12 @@ class LidarProcessorNode(Node):
         self.max_dt = 1.0 / self.get_parameter('max_process_hz').value
         self.last_process_time = 0.0
 
-        # ── QoS ─────────────────────────────────────────────────
         gz_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
             depth=1,
         )
 
-        # ── Sub / Pub ───────────────────────────────────────────
         self.create_subscription(
             LaserScan,
             '/wamv/sensors/lidars/lidar_wamv_sensor/scan',
@@ -123,10 +98,7 @@ class LidarProcessorNode(Node):
         self.pub_obstacles = self.create_publisher(String, '/asv/obstacles', 10)
 
         self.get_logger().info(
-            f'LidarProcessor started — eps={self.eps}, '
-            f'range=[{self.min_range}, {self.max_range}]m')
-
-    # ── Scan callback ───────────────────────────────────────────────
+            f'LidarProcessor initialized (min_pts={self.min_pts}, eps={self.eps}m)')
 
     def _scan_cb(self, msg: LaserScan):
         now = time.monotonic()
@@ -134,18 +106,15 @@ class LidarProcessorNode(Node):
             return
         self.last_process_time = now
 
-        # Convert polar → cartesian
         angles = np.arange(
             msg.angle_min,
             msg.angle_min + len(msg.ranges) * msg.angle_increment,
             msg.angle_increment,
         )
-        # Trim to same length (floating point accumulation can add/remove 1)
         n = min(len(angles), len(msg.ranges))
         angles = angles[:n]
         ranges = np.array(msg.ranges[:n], dtype=np.float32)
 
-        # Filter invalid and out-of-range
         valid = (
             np.isfinite(ranges) &
             (ranges >= self.min_range) &
@@ -158,22 +127,23 @@ class LidarProcessorNode(Node):
             self._publish([])
             return
 
-        # Polar to Cartesian (LiDAR frame: x forward, y left)
         xs = ranges * np.cos(angles)
         ys = ranges * np.sin(angles)
         points = np.column_stack((xs, ys))
 
-        # Cluster
         clusters = simple_dbscan(points, self.eps, self.min_pts)
 
-        # Extract obstacle info
         obstacles = []
         for cluster in clusters:
             centroid = cluster.mean(axis=0)
-            # Diameter ≈ max pairwise distance (fast approx: max - min per axis)
             span_x = cluster[:, 0].max() - cluster[:, 0].min()
             span_y = cluster[:, 1].max() - cluster[:, 1].min()
             diameter = max(span_x, span_y)
+
+            # Buoy physical size filter: diameter must be between 0.25m and 2.5m
+            # Ignores large wave lines or tiny single-point noise
+            if diameter < 0.25 or diameter > 2.5:
+                continue
 
             obstacles.append({
                 'x': round(float(centroid[0]), 2),
