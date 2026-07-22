@@ -24,7 +24,6 @@ from launch_ros.actions import Node
 def generate_launch_description():
     # ── Paths ───────────────────────────────────────────────────
     pkg_share = get_package_share_directory('asv_perception')
-    config_file = os.path.join(pkg_share, 'config', 'patrol_waypoints.yaml')
 
     # VRX launch file — assumes vrx_gz is installed in the same workspace
     try:
@@ -85,21 +84,20 @@ def generate_launch_description():
         }],
     )
 
-    # Load waypoints from YAML config
+    # Perception-driven planner (no waypoints needed)
     reactive_planner = Node(
         package='asv_perception',
         executable='reactive_planner_node',
         name='reactive_planner_node',
         output='screen',
-        parameters=[config_file, {
-            'use_enu_waypoints': True,
-            'arrival_radius': 5.0,
+        parameters=[{
             'base_thrust': 8.0,
+            'explore_thrust': 5.0,
             'danger_radius': 8.0,
             'kp': 5.0,
             'kd': 1.0,
             'avoidance_gain': 30.0,
-            'loop_patrol': True,
+            'gate_approach_bearing_threshold': 45.0,
         }],
     )
 
