@@ -29,9 +29,10 @@ Visualization Manager:
       Name: TF
       Enabled: true
   Global Options:
-    Fixed Frame: world
+    Fixed Frame: wamv/wamv/base_link
   Views:
     Current:
       Class: rviz_default_plugins/ThirdPersonFollower
       Target Frame: wamv/wamv/base_link
       Distance: 30
+

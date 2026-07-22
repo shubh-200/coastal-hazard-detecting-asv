@@ -232,20 +232,30 @@ class SensorFusionNode(Node):
         self.pub_hazards.publish(msg)
 
     def _publish_markers(self):
+        """Publish RViz MarkerArray for all catalogued hazards in base_link frame."""
         ma = MarkerArray()
         delete = Marker()
         delete.action = Marker.DELETEALL
         ma.markers.append(delete)
 
+        px, py = self.pos_enu if self.pos_enu else (0.0, 0.0)
+        yaw = self.yaw if self.yaw is not None else 0.0
+
         for h in self.hazard_catalogue:
+            # Transform world ENU -> body frame for RViz visualization
+            dx = h['x'] - px
+            dy = h['y'] - py
+            bx = dx * math.cos(yaw) + dy * math.sin(yaw)
+            by = -dx * math.sin(yaw) + dy * math.cos(yaw)
+
             m = Marker()
-            m.header.frame_id = 'world'
+            m.header.frame_id = 'wamv/wamv/base_link'
             m.header.stamp = self.get_clock().now().to_msg()
             m.ns = 'hazards'
             m.id = h['id']
             m.type = Marker.CYLINDER
             m.action = Marker.ADD
-            m.pose.position = Point(x=float(h['x']), y=float(h['y']), z=0.0)
+            m.pose.position = Point(x=float(bx), y=float(by), z=0.0)
             m.pose.orientation.w = 1.0
 
             if h.get('shape') == 'conical':
@@ -265,7 +275,7 @@ class SensorFusionNode(Node):
             t.id = h['id'] + 1000
             t.type = Marker.TEXT_VIEW_FACING
             t.action = Marker.ADD
-            t.pose.position = Point(x=float(h['x']), y=float(h['y']), z=2.5)
+            t.pose.position = Point(x=float(bx), y=float(by), z=2.5)
             t.pose.orientation.w = 1.0
             t.scale = Vector3(x=0.0, y=0.0, z=0.6)
             t.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
@@ -274,6 +284,7 @@ class SensorFusionNode(Node):
             ma.markers.append(t)
 
         self.pub_markers.publish(ma)
+
 
     def _publish_log(self):
         counts = {}
